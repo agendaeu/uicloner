@@ -1,5 +1,5 @@
 // server.js — SRIP Backend Completo
-// Deploy: Render (free tier) | Node 18+
+// Deploy: Railway | Node 20+
 // Start command: node server.js
 // Env vars: ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
 
@@ -44,8 +44,18 @@ async function openPage(browser, url) {
   await page.setUserAgent(
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   );
-  await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
-  await new Promise(r => setTimeout(r, 2000));
+
+  // Usa 'load' em vez de 'networkidle2' — evita travamento em sites com
+  // websockets, polling ou requests contínuos que nunca atingem idle.
+  try {
+    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+  } catch {
+    // Fallback: se load falhar, aguarda apenas o DOM
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+  }
+
+  // Aguarda hidratação de JS (React, Next, Vue, etc.)
+  await new Promise(r => setTimeout(r, 3000));
   return page;
 }
 
@@ -287,8 +297,17 @@ async function captureScrollScreenshots(page) {
 async function callClaude(systemPrompt, userContent, maxTokens = 8000) {
   const res = await fetch(ANTHROPIC_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: CLAUDE_MODEL, max_tokens: maxTokens, system: systemPrompt, messages: [{ role: 'user', content: userContent }] }),
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userContent }],
+    }),
   });
   if (!res.ok) throw new Error(`Claude API ${res.status}: ${await res.text()}`);
   const data = await res.json();
@@ -335,7 +354,8 @@ Begin with: AUDIT_MODE: [standard|high-fidelity]`;
 
 async function phase1_forensicAudit(runId, rawDNA, mode, screenshots) {
   const screenshotMeta = screenshots.map(s => `Screenshot at ${s.position} scroll (y=${s.scrollY}px)`).join('\n');
-  const siteDNA = await callClaude(PHASE1_SYSTEM,
+  const siteDNA = await callClaude(
+    PHASE1_SYSTEM,
     `AUDIT_MODE: ${mode}\n\nRAW PUPPETEER DATA:\n${JSON.stringify(rawDNA, null, 2)}\n\nSCREENSHOTS:\n${screenshotMeta}\n\nSynthesize into complete Site DNA.`,
     10000
   );
@@ -360,7 +380,8 @@ technical requirements block, execution directive.
 Output the complete prompt in a single fenced code block.`;
 
 async function phase3_synthesis(runId, siteDNA, brandInterview, targetTool, mode) {
-  const prompt = await callClaude(PHASE3_SYSTEM,
+  const prompt = await callClaude(
+    PHASE3_SYSTEM,
     `AUDIT_MODE: ${mode}\nTARGET TOOL: ${targetTool}\n\n## SITE DNA\n${siteDNA}\n\n## BRAND INTERVIEW\n${brandInterview}`,
     12000
   );
@@ -377,7 +398,8 @@ Enforce zero generic language: replace "some animation", "nice hover", "smooth t
 Output: brief checklist of items passed/patched, then the final verified prompt in a fenced code block.`;
 
 async function phase4_qualityCheck(runId, replicationPrompt, mode) {
-  const finalPrompt = await callClaude(PHASE4_SYSTEM,
+  const finalPrompt = await callClaude(
+    PHASE4_SYSTEM,
     `AUDIT_MODE: ${mode}\n\n## REPLICATION PROMPT\n${replicationPrompt}`,
     12000
   );
@@ -397,7 +419,8 @@ End with Master Correction Summary and single Final Dial-In Prompt.
 Rules: never skip a pass, every corrective prompt is self-contained, cite exact Site DNA values.`;
 
 async function runIterator(runId, siteDNA, currentImplementation) {
-  const output = await callClaude(ITERATOR_SYSTEM,
+  const output = await callClaude(
+    ITERATOR_SYSTEM,
     `## SITE DNA\n${siteDNA}\n\n## CURRENT IMPLEMENTATION\n${currentImplementation}`,
     12000
   );
@@ -427,16 +450,26 @@ app.get('/health', (_, res) => res.json({ status: 'ok', service: 'SRIP Backend' 
 app.post('/audit', async (req, res) => {
   const { url, mode = 'standard' } = req.body;
   if (!url) return res.status(400).json({ error: 'URL obrigatória' });
+
   let browser;
+  const AUDIT_TIMEOUT = 120_000; // 2 minutos máximo
+
+  const timer = setTimeout(() => {
+    if (browser) browser.close().catch(() => {});
+    if (!res.headersSent) res.status(504).json({ error: 'Audit timeout (120s)' });
+  }, AUDIT_TIMEOUT);
+
   try {
     browser = await launchBrowser();
     const page = await openPage(browser, url);
     const siteDNA = await runForensicAudit(page, mode);
+    clearTimeout(timer);
     res.json({ success: true, url, mode, siteDNA });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    clearTimeout(timer);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   } finally {
-    if (browser) await browser.close();
+    if (browser) await browser.close().catch(() => {});
   }
 });
 
@@ -448,8 +481,10 @@ app.post('/pipeline/run', async (req, res) => {
   const runId = randomUUID();
   res.json({ runId, status: 'started' }); // Responde imediatamente ao frontend
 
-  // Roda em background
-  (async () => {
+  // Roda em background com timeout global de 3 minutos
+  const PIPELINE_TIMEOUT = 180_000;
+
+  const pipelineWork = async () => {
     let browser;
     try {
       browser = await launchBrowser();
@@ -460,9 +495,17 @@ app.post('/pipeline/run', async (req, res) => {
     } catch (err) {
       console.error(`[Pipeline Error] ${runId}:`, err.message);
       await updateRun(runId, { status: 'error', error: err.message });
-      if (browser) await browser.close();
+      if (browser) await browser.close().catch(() => {});
     }
-  })();
+  };
+
+  Promise.race([
+    pipelineWork(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Pipeline timeout')), PIPELINE_TIMEOUT)),
+  ]).catch(async (err) => {
+    console.error(`[Pipeline Timeout] ${runId}:`, err.message);
+    await updateRun(runId, { status: 'error', error: err.message }).catch(() => {});
+  });
 });
 
 // Status do run
@@ -476,7 +519,6 @@ app.get('/pipeline/status/:runId', async (req, res) => {
 app.get('/pipeline/result/:runId', async (req, res) => {
   const { data, error } = await supabase.storage.from('srip-plans').list(req.params.runId);
   if (error) return res.status(404).json({ error: 'Run não encontrado' });
-  // Retorna URLs públicas de cada arquivo
   const files = (data || []).map(f => ({
     name: f.name,
     url: supabase.storage.from('srip-plans').getPublicUrl(`${req.params.runId}/${f.name}`).data.publicUrl,
