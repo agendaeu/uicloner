@@ -4,7 +4,8 @@
 // Env vars: ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 const cors = require('cors');
 const { randomUUID } = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
@@ -26,21 +27,13 @@ const supabase = createClient(
 // PUPPETEER HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function getBrowserArgs() {
-  return [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--no-first-run',
-    '--no-zygote',
-    '--single-process',
-    '--disable-extensions',
-  ];
-}
-
 async function launchBrowser() {
-  return puppeteer.launch({ headless: 'new', args: getBrowserArgs() });
+  return puppeteer.launch({
+    args: chromium.args,
+    defaultViewport: chromium.defaultViewport,
+    executablePath: await chromium.executablePath(),
+    headless: chromium.headless,
+  });
 }
 
 async function openPage(browser, url) {
