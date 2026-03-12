@@ -429,16 +429,6 @@ async function runIterator(runId, siteDNA, currentImplementation) {
   return output;
 }
 
-async function runFullPipeline({ runId, url, mode, rawDNA, screenshots, brandAnswers, targetTool = 'Claude' }) {
-  await createRun(runId, url, mode);
-  await saveScreenshots(runId, screenshots);
-  const siteDNA = await phase1_forensicAudit(runId, rawDNA, mode, screenshots);
-  const brandInterview = await phase2_saveBrandInterview(runId, brandAnswers);
-  const replicationPrompt = await phase3_synthesis(runId, siteDNA, brandInterview, targetTool, mode);
-  const finalPrompt = await phase4_qualityCheck(runId, replicationPrompt, mode);
-  return { success: true, runId, siteDNA, brandInterview, replicationPrompt, finalPrompt };
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -479,9 +469,20 @@ app.post('/pipeline/run', async (req, res) => {
   if (!url || !brandAnswers) return res.status(400).json({ error: 'url e brandAnswers são obrigatórios' });
 
   const runId = randomUUID();
-  res.json({ runId, status: 'started' }); // Responde imediatamente ao frontend
 
-  // Roda em background com timeout global de 3 minutos
+  // ✅ FIX: Cria o run no Supabase ANTES de responder ao frontend.
+  // Sem isso, o polling imediato retorna 404 porque o registro ainda
+  // não existe — createRun estava dentro do bloco async de background.
+  try {
+    await createRun(runId, url, mode);
+  } catch (err) {
+    return res.status(500).json({ error: `Falha ao criar run: ${err.message}` });
+  }
+
+  // Responde imediatamente — frontend já pode iniciar o polling com segurança
+  res.json({ runId, status: 'started' });
+
+  // Roda o pipeline em background com timeout global de 3 minutos
   const PIPELINE_TIMEOUT = 180_000;
 
   const pipelineWork = async () => {
@@ -491,7 +492,12 @@ app.post('/pipeline/run', async (req, res) => {
       const page = await openPage(browser, url);
       const rawDNA = await runForensicAudit(page, mode);
       await browser.close(); browser = null;
-      await runFullPipeline({ runId, url, mode, rawDNA, screenshots: rawDNA.screenshots, brandAnswers, targetTool });
+
+      await saveScreenshots(runId, rawDNA.screenshots);
+      const siteDNA = await phase1_forensicAudit(runId, rawDNA, mode, rawDNA.screenshots);
+      const brandInterview = await phase2_saveBrandInterview(runId, brandAnswers);
+      const replicationPrompt = await phase3_synthesis(runId, siteDNA, brandInterview, targetTool, mode);
+      await phase4_qualityCheck(runId, replicationPrompt, mode);
     } catch (err) {
       console.error(`[Pipeline Error] ${runId}:`, err.message);
       await updateRun(runId, { status: 'error', error: err.message });
@@ -501,7 +507,9 @@ app.post('/pipeline/run', async (req, res) => {
 
   Promise.race([
     pipelineWork(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('Pipeline timeout')), PIPELINE_TIMEOUT)),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Pipeline timeout (180s)')), PIPELINE_TIMEOUT)
+    ),
   ]).catch(async (err) => {
     console.error(`[Pipeline Timeout] ${runId}:`, err.message);
     await updateRun(runId, { status: 'error', error: err.message }).catch(() => {});
