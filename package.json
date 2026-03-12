@@ -15,8 +15,3 @@
     "node": ">=20"
   }
 }
-```
-
-E adiciona esta variável de ambiente no Railway:
-```
-PUPPETEER_EXECUTABLE_PATH = /usr/bin/chromium-browser
