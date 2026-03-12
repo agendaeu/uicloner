@@ -14,7 +14,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const CLAUDE_MODEL = 'claude-opus-4-5';
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 
